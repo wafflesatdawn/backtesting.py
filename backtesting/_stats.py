@@ -1,5 +1,5 @@
-from typing import TYPE_CHECKING, List, Union
-
+from typing import List, TYPE_CHECKING, Union
+from sklearn.linear_model import LinearRegression
 import numpy as np
 import pandas as pd
 
@@ -52,7 +52,7 @@ def compute_stats(
         index=index)
 
     if isinstance(trades, pd.DataFrame):
-        trades_df: pd.DataFrame = trades
+        trades_df = trades
     else:
         # Came straight from Backtest.run()
         trades_df = pd.DataFrame({
@@ -65,7 +65,6 @@ def compute_stats(
             'ReturnPct': [t.pl_pct for t in trades],
             'EntryTime': [t.entry_time for t in trades],
             'ExitTime': [t.exit_time for t in trades],
-            'Tag': [t.tag for t in trades],
         })
         trades_df['Duration'] = trades_df['ExitTime'] - trades_df['EntryTime']
     del trades
@@ -73,6 +72,7 @@ def compute_stats(
     pl = trades_df['PnL']
     returns = trades_df['ReturnPct']
     durations = trades_df['Duration']
+    
 
     def _round_timedelta(value, _period=_data_period(index)):
         if not isinstance(value, pd.Timedelta):
@@ -105,7 +105,6 @@ def compute_stats(
         annual_trading_days = float(
             365 if index.dayofweek.to_series().between(5, 6).mean() > 2/7 * .6 else
             252)
-
     # Annualized return and risk metrics are computed based on the (mostly correct)
     # assumption that the returns are compounded. See: https://dx.doi.org/10.2139/ssrn.3054517
     # Our annualized return matches `empyrical.annual_return(day_returns)` whereas
@@ -116,20 +115,43 @@ def compute_stats(
     # s.loc['Return (Ann.) [%]'] = gmean_day_return * annual_trading_days * 100
     # s.loc['Risk (Ann.) [%]'] = day_returns.std(ddof=1) * np.sqrt(annual_trading_days) * 100
 
-    # Our Sharpe mismatches `empyrical.sharpe_ratio()` because they use arithmetic mean return
-    # and simple standard deviation
-    s.loc['Sharpe Ratio'] = (s.loc['Return (Ann.) [%]'] - risk_free_rate) / (s.loc['Volatility (Ann.) [%]'] or np.nan)  # noqa: E501
-    # Our Sortino mismatches `empyrical.sortino_ratio()` because they use arithmetic mean return
-    s.loc['Sortino Ratio'] = (annualized_return - risk_free_rate) / (np.sqrt(np.mean(day_returns.clip(-np.inf, 0)**2)) * np.sqrt(annual_trading_days))  # noqa: E501
+    # # Our Sharpe mismatches `empyrical.sharpe_ratio()` because they use arithmetic mean return
+    # # and simple standard deviation
+    # s.loc['Sharpe Ratio'] = np.clip((s.loc['Return (Ann.) [%]'] - risk_free_rate) / (s.loc['Volatility (Ann.) [%]'] or np.nan), 0, np.inf)  # noqa: E501
+    # # Our Sortino mismatches `empyrical.sortino_ratio()` because they use arithmetic mean return
+    # s.loc['Sortino Ratio'] = np.clip((annualized_return - risk_free_rate) / (np.sqrt(np.mean(day_returns.clip(-np.inf, 0)**2)) * np.sqrt(annual_trading_days)), 0, np.inf)  # noqa: E501
     max_dd = -np.nan_to_num(dd.max())
-    s.loc['Calmar Ratio'] = annualized_return / (-max_dd or np.nan)
+    # s.loc['Calmar Ratio'] = np.clip(annualized_return / (-max_dd or np.nan), 0, np.inf)
     s.loc['Max. Drawdown [%]'] = max_dd * 100
     s.loc['Avg. Drawdown [%]'] = -dd_peaks.mean() * 100
     s.loc['Max. Drawdown Duration'] = _round_timedelta(dd_dur.max())
     s.loc['Avg. Drawdown Duration'] = _round_timedelta(dd_dur.mean())
+    # cases: large number of trades, 1-5 trades, 0 trades
+    if dd_dur.count() > 5:
+        avg_longest_dd = dd_dur.nlargest(5).mean().days / annual_trading_days
+        avg_deepest_dd = dd_peaks.nlargest(5).mean()
+        length_adjusted_avgmaxdd = (avg_deepest_dd * avg_longest_dd).item()
+    elif round(dd_dur.count()/2) > 0:
+        x = round(dd_dur.count()/2)
+        avg_longest_dd = dd_dur.nlargest(x).mean().days / annual_trading_days
+        avg_deepest_dd = dd_peaks.nlargest(x).mean()
+        length_adjusted_avgmaxdd = (avg_deepest_dd * avg_longest_dd).item()
+    else:
+        length_adjusted_avgmaxdd = np.nan
+    if trades_df.empty:
+        regression_coef = np.nan
+    else:
+        model = LinearRegression()
+        model.fit(np.array(trades_df.index).reshape((-1,1)), np.array(trades_df.ReturnPct).reshape((-1,1)))
+        regression_coef = model.coef_.item()
+    # robust annualized return - best fit line as measure of performance rather than precise returns
+    s.loc['RAR [%]'] = regression_coef * 100
+    s.loc['DrawdownFactor'] = length_adjusted_avgmaxdd # smaller is better
+    # robust risk reward ratio - the size of drawdowns matters just as much as duration of drawdown, so multiply them to represent the combined impact of both
+    s.loc['RRRR'] = (regression_coef * 100) / length_adjusted_avgmaxdd
+    s.loc['R-Sharpe'] =  (regression_coef - risk_free_rate) / (s.loc['Volatility (Ann.) [%]'] or np.nan)
     s.loc['# Trades'] = n_trades = len(trades_df)
-    win_rate = np.nan if not n_trades else (pl > 0).mean()
-    s.loc['Win Rate [%]'] = win_rate * 100
+    s.loc['Win Rate [%]'] = np.nan if not n_trades else (pl > 0).sum() / n_trades * 100  # noqa: E501
     s.loc['Best Trade [%]'] = returns.max() * 100
     s.loc['Worst Trade [%]'] = returns.min() * 100
     mean_return = geometric_mean(returns)
@@ -139,7 +161,6 @@ def compute_stats(
     s.loc['Profit Factor'] = returns[returns > 0].sum() / (abs(returns[returns < 0].sum()) or np.nan)  # noqa: E501
     s.loc['Expectancy [%]'] = returns.mean() * 100
     s.loc['SQN'] = np.sqrt(n_trades) * pl.mean() / (pl.std() or np.nan)
-    s.loc['Kelly Criterion'] = win_rate - (1 - win_rate) / (pl[pl > 0].mean() / -pl[pl < 0].mean())
 
     s.loc['_strategy'] = strategy_instance
     s.loc['_equity_curve'] = equity_df
